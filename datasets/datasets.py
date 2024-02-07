@@ -3,7 +3,7 @@ import os
 import torch
 
 
-DEFAULT_ROOT = './materials'
+DEFAULT_ROOT = '../datasets/'
 datasets = {}
 
 def register(name):
@@ -15,7 +15,7 @@ def register(name):
 
 def make(name, **kwargs):
   if kwargs.get('root_path') is None:
-    kwargs['root_path'] = os.path.join(DEFAULT_ROOT, name.replace('meta-', ''))
+    kwargs['root_path'] = os.path.join(DEFAULT_ROOT, name.replace('meta-', '').replace('folder-', ''))
   dataset = datasets[name](**kwargs)
   return dataset
 

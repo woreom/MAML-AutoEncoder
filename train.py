@@ -16,7 +16,109 @@ import datasets
 import models
 import utils
 import utils.optimizers as optimizers
+from models.encoders.autoencoders import DecoderResidualBlock
+from torchsummary import summary
 
+class ResNet12Decoder(nn.Module):
+    def __init__(self):
+        super(ResNet12Decoder, self).__init__()
+        configs = [1, 2, 2, 2]
+        # self.linear = nn.Linear(in_features=512, out_features=512*3*3)
+        self.conv1 = DecoderResidualBlock(hidden_channels=512, output_channels=256, layers=configs[0])
+        self.conv2 = DecoderResidualBlock(hidden_channels=256, output_channels=128, layers=configs[1])
+        self.conv3 = DecoderResidualBlock(hidden_channels=128, output_channels=64,  layers=configs[2])
+        self.conv4 = DecoderResidualBlock(hidden_channels=64,  output_channels=64,  layers=configs[3])
+
+        self.conv5 = nn.Sequential(
+            nn.BatchNorm2d(num_features=64),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(in_channels=64, out_channels=3, kernel_size=3, stride=2, padding=7,
+                               output_padding=1, bias=False),
+        )
+
+        self.gate = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.reshape((x.shape[0], 512, 1, 1))
+        x = x.expand(x.shape[0], 512, 3, 3)
+        # x = x.expand(1, 512, 3, 3)
+        # x = x.reshape((x.shape[0], 512, 1, 1))
+        # print(x.shape)
+        # x = self.linear(x)
+        # x = x.reshape((x.shape[0],-1,3,3))
+        
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.conv5(x)
+        x = self.gate(x)
+
+        return x
+
+class Shallow_Decoder(torch.nn.Sequential):
+
+    def __init__(self,
+                 hidden=64,
+                 channels=1,
+                 max_pool=False,
+                 layers=4,
+                 max_pool_factor=1.0):
+        core = [nn.ConvTranspose2d(in_channels=channels, out_channels=hidden, kernel_size=3,
+                                   stride=2, padding=1,), nn.BatchNorm2d(hidden), nn.ReLU()]
+        for _ in range(layers - 2):
+            core.extend([nn.ConvTranspose2d(in_channels=hidden, out_channels=hidden, kernel_size=3,
+                                            stride=1, padding=0,), nn.BatchNorm2d(hidden), nn.ReLU()])
+            
+        core.extend([nn.ConvTranspose2d(in_channels=hidden, out_channels=3, kernel_size=2,
+                                        stride=1, padding=0,), nn.BatchNorm2d(3),nn.Sigmoid()])
+            
+        super(Shallow_Decoder, self).__init__(*core)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.reshape((x.shape[0], 1, 40, 40))
+        x = super(Shallow_Decoder, self).forward(x)
+
+        return x
+    
+class Deep_Decoder(torch.nn.Sequential):
+
+    def __init__(self,
+                 hidden=64,
+                 channels=64,
+                 max_pool=False,
+                 layers=4,
+                 max_pool_factor=1.0):
+        core = [nn.ConvTranspose2d(in_channels=channels, out_channels=hidden, kernel_size=3,
+                                   stride=2, padding=0,), nn.BatchNorm2d(hidden), nn.ReLU()]
+        for _ in range(layers - 2):
+            core.extend([nn.ConvTranspose2d(in_channels=hidden, out_channels=hidden, kernel_size=5,
+                                            stride=2, padding=2,), nn.BatchNorm2d(hidden), nn.ReLU()])
+            
+        core.extend([nn.ConvTranspose2d(in_channels=hidden, out_channels=3, kernel_size=6,
+                                        stride=2, padding=1,), nn.BatchNorm2d(3),nn.Sigmoid()])
+            
+        super(Deep_Decoder, self).__init__(*core)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.reshape((x.shape[0], 64, 5, 5))
+        # print(x.shape)
+        # x = x.expand(x.shape[0], 1600, 3, 3)
+        x = super(Deep_Decoder, self).forward(x)
+
+        return x
+
+class SimpleAutoEncoder(nn.Module):
+    def __init__(self, encoder, decoder):
+        super(SimpleAutoEncoder, self).__init__()
+        
+        self.encoder = encoder
+        self.decoder = decoder
+    
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x
 
 def main(config):
   random.seed(0)
@@ -27,9 +129,10 @@ def main(config):
   # torch.backends.cudnn.benchmark = False
 
   ckpt_name = args.name
+  meta_task = config.get('meta_autoencoder')
   if ckpt_name is None:
     ckpt_name = config['encoder']
-    ckpt_name += '_' + config['dataset'].replace('meta-', '')
+    ckpt_name += '_' + config['dataset'].replace('meta-', '').replace('folder-','')+f'-{meta_task}'
     ckpt_name += '_{}_way_{}_shot'.format(
       config['train']['n_way'], config['train']['n_shot'])
   if args.tag is not None:
@@ -61,6 +164,17 @@ def main(config):
     val_loader = DataLoader(
       val_set, config['val']['n_episode'],
       collate_fn=datasets.collate_fn, num_workers=1, pin_memory=True)
+    
+  # meta-test
+  eval_test = False
+  if config.get('test'):
+    eval_test = True
+    test_set = datasets.make(config['dataset'], **config['test'])
+    utils.log('meta-test set: {} (x{}), {}'.format(
+      test_set[0][0].shape, len(test_set), test_set.n_classes))
+    test_loader = DataLoader(
+      test_set, config['test']['n_episode'],
+      collate_fn=datasets.collate_fn, num_workers=1, pin_memory=True)
   
   ##### Model and Optimizer #####
 
@@ -87,6 +201,32 @@ def main(config):
     start_epoch = 1
     max_va = 0.
 
+    meta_task = config.get('meta_autoencoder')
+    if meta_task:
+      # autoencoder = SimpleAutoEncoder(model.encoder, ResNet12Decoder()).cuda()
+      # autoencoder = SimpleAutoEncoder(model.encoder, Shallow_Decoder()).cuda()
+      autoencoder = SimpleAutoEncoder(model.encoder, Deep_Decoder()).cuda()
+
+      opt = torch.optim.Adam(autoencoder.parameters(),
+                                  lr=1e-6)
+      criterion = nn.MSELoss()
+
+      # _input = torch.randn((1,3,84,84)).cuda()
+
+      # print(f"encoder output: {_input.shape}")
+
+      # output = autoencoder.encoder(_input)
+
+      # print(f"encoder output: {output.shape}")
+
+      # output = autoencoder.decoder(output)
+
+      # print(f"decoder output: {output.shape}")
+
+      # print(summary(autoencoder.encoder,(3,84,84)))
+      # print(summary(autoencoder.decoder,(1600, 1, 1)))
+
+    
   if args.efficient:
     model.go_efficient()
 
@@ -102,7 +242,9 @@ def main(config):
   # 'ta': meta-train accuracy
   # 'vl': meta-val loss
   # 'va': meta-val accuracy
-  aves_keys = ['tl', 'ta', 'vl', 'va']
+  # 'tel': meta-test loss
+  # 'tea': meta-test accuracy
+  aves_keys = ['tl', 'ta', 'vl', 'va', 'tel', 'tea']
   trlog = dict()
   for k in aves_keys:
     trlog[k] = []
@@ -126,6 +268,14 @@ def main(config):
           model.module.reset_classifier()
         else:
           model.reset_classifier()
+      if meta_task:
+        img_size = x_shot.shape[-1]
+        recon = autoencoder(x_shot.reshape(-1,3,img_size,img_size))
+        error = criterion(recon, x_shot.reshape(-1,3,img_size,img_size))
+
+        opt.zero_grad()
+        error.backward()
+        opt.step()
 
       logits = model(x_shot, x_query, y_shot, inner_args, meta_train=True)
       logits = logits.flatten(0, 1)
@@ -169,6 +319,32 @@ def main(config):
         aves['vl'].update(loss.item(), 1)
         aves['va'].update(acc, 1)
 
+    # meta-test
+    if eval_test:
+      model.eval()
+      np.random.seed(0)
+
+      for data in tqdm(test_loader, desc='meta-test', leave=False):
+        x_shot, x_query, y_shot, y_query = data
+        x_shot, y_shot = x_shot.cuda(), y_shot.cuda()
+        x_query, y_query = x_query.cuda(), y_query.cuda()
+
+        if inner_args['reset_classifier']:
+          if config.get('_parallel'):
+            model.module.reset_classifier()
+          else:
+            model.reset_classifier()
+
+        logits = model(x_shot, x_query, y_shot, inner_args, meta_train=False)
+        logits = logits.flatten(0, 1)
+        labels = y_query.flatten()
+        
+        pred = torch.argmax(logits, dim=-1)
+        acc = utils.compute_acc(pred, labels)
+        loss = F.cross_entropy(logits, labels)
+        aves['tel'].update(loss.item(), 1)
+        aves['tea'].update(acc, 1)
+
     if lr_scheduler is not None:
       lr_scheduler.step()
 
@@ -182,15 +358,20 @@ def main(config):
       (epoch - start_epoch + 1) * (config['epoch'] - start_epoch + 1))
 
     # formats output
-    log_str = 'epoch {}, meta-train {:.4f}|{:.4f}'.format(
-      str(epoch), aves['tl'], aves['ta'])
+    log_str = f"Epoch {epoch}:(train) acc={aves['ta']*100:.2f}%, loss={aves['tl']:.4f}"
+
     writer.add_scalars('loss', {'meta-train': aves['tl']}, epoch)
     writer.add_scalars('acc', {'meta-train': aves['ta']}, epoch)
 
     if eval_val:
-      log_str += ', meta-val {:.4f}|{:.4f}'.format(aves['vl'], aves['va'])
+      log_str += f"|(val) acc={aves['va']*100:.2f}%, loss={aves['vl']:.4f}"
       writer.add_scalars('loss', {'meta-val': aves['vl']}, epoch)
       writer.add_scalars('acc', {'meta-val': aves['va']}, epoch)
+
+    if eval_test:
+      log_str += f"|(test) acc={aves['tea']*100:.2f}%, loss={aves['tel']:.4f}"
+      writer.add_scalars('loss', {'meta-test': aves['tel']}, epoch)
+      writer.add_scalars('acc', {'meta-test': aves['tea']}, epoch)
 
     log_str += ', {} {}/{}'.format(t_epoch, t_elapsed, t_estimate)
     utils.log(log_str)
